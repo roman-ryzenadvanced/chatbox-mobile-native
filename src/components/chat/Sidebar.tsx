@@ -90,7 +90,7 @@ function ConversationItem({
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium">{conversation.title}</p>
           <p className="text-[11px] text-muted-foreground">
-            {conversation.messageCount ?? 0} messages · {formatDate(conversation.updatedAt)}
+            {conversation.messages?.length ?? 0} messages · {formatDate(conversation.updatedAt)}
           </p>
         </div>
         <AlertDialog>

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useRef } from 'react';
 import { Menu, Settings } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { toast } from 'sonner';
@@ -52,49 +52,12 @@ export default function Home() {
   const store = useChatStore();
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Fetch conversations on mount
-  const fetchConversations = useCallback(async () => {
-    try {
-      store.setIsLoadingConversations(true);
-      const res = await fetch('/api/conversations');
-      if (res.ok) {
-        const data = await res.json();
-        store.setConversations(data);
-      }
-    } catch {
-      toast.error('Failed to load conversations');
-    } finally {
-      store.setIsLoadingConversations(false);
-    }
-  }, [store]);
-
-  useEffect(() => {
-    fetchConversations();
-  }, [fetchConversations]);
-
-  // Fetch messages for active conversation
-  const fetchMessages = useCallback(
-    async (conversationId: string) => {
-      try {
-        const res = await fetch(`/api/conversations/${conversationId}/messages`);
-        if (res.ok) {
-          const data: Message[] = await res.json();
-          store.setMessages(data);
-        }
-      } catch {
-        toast.error('Failed to load messages');
-      }
-    },
-    [store]
-  );
-
   // Handle selecting a conversation
   const handleSelectConversation = useCallback(
-    async (id: string) => {
+    (id: string) => {
       store.setActiveConversation(id);
-      await fetchMessages(id);
     },
-    [store, fetchMessages]
+    [store]
   );
 
   // Handle new chat
@@ -107,36 +70,27 @@ export default function Home() {
     async (text: string) => {
       let conversationId = store.activeConversationId;
 
-      // If no active conversation, create one
+      // If no active conversation, create one locally
       if (!conversationId) {
-        try {
-          const res = await fetch('/api/conversations', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              title: text.slice(0, 30) + (text.length > 30 ? '...' : ''),
-              systemPrompt: store.systemPrompt,
-            }),
-          });
-          if (!res.ok) throw new Error('Failed to create conversation');
-          const conv: Conversation = await res.json();
-          conversationId = conv.id;
-          store.setActiveConversation(conversationId);
-          store.setConversations([conv, ...store.conversations]);
-        } catch {
-          toast.error('Failed to start conversation');
-          return;
-        }
+        const conv = store.createConversation(
+          text.slice(0, 30) + (text.length > 30 ? '...' : ''),
+          store.systemPrompt
+        );
+        conversationId = conv.id;
+        store.setActiveConversation(conversationId);
       }
 
-      // Optimistically add user message
+      // Build user message
       const userMessage: Message = {
-        id: `temp-user-${Date.now()}`,
+        id: `msg-${Date.now()}`,
         role: 'user',
         content: text,
         createdAt: new Date().toISOString(),
       };
+
+      // Add to UI and local state
       store.addMessage(userMessage);
+      store.addMessageToConversation(conversationId, userMessage);
 
       // Start streaming
       store.setIsSending(true);
@@ -146,13 +100,23 @@ export default function Home() {
       abortControllerRef.current = abortController;
 
       try {
+        // Build message history for the API
+        const conv = store.conversations.find(c => c.id === conversationId);
+        const systemPrompt = conv?.systemPrompt || store.systemPrompt;
+        const convMessages = conv?.messages || store.messages;
+
+        const apiMessages = [
+          { role: 'system', content: systemPrompt },
+          ...convMessages.map(m => ({
+            role: m.role === 'user' ? 'user' : 'assistant',
+            content: m.content,
+          })),
+        ];
+
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            conversationId,
-            message: text,
-          }),
+          body: JSON.stringify({ messages: apiMessages }),
           signal: abortController.signal,
         });
 
@@ -172,7 +136,6 @@ export default function Home() {
           if (done) break;
 
           const chunk = decoder.decode(value, { stream: true });
-          // Parse SSE format: split by newlines, filter for "data: " lines
           const lines = chunk.split('\n');
 
           for (const line of lines) {
@@ -183,13 +146,12 @@ export default function Home() {
 
               try {
                 const parsed = JSON.parse(data);
-                const content = parsed.content || parsed.choices?.[0]?.delta?.content || '';
+                const content = parsed.content || '';
                 if (content) {
                   fullContent += content;
                   store.appendStreamingContent(content);
                 }
               } catch {
-                // If not JSON, treat the raw data as content
                 if (data && data !== '[DONE]') {
                   fullContent += data;
                   store.appendStreamingContent(data);
@@ -199,15 +161,20 @@ export default function Home() {
           }
         }
 
-        // Streaming complete - reload messages from server to get persisted versions
+        // Streaming complete - save the assistant message
         store.setStreamingContent('');
         store.setIsSending(false);
         abortControllerRef.current = null;
 
-        if (conversationId) {
-          await fetchMessages(conversationId);
-          // Refresh conversation list to get updated message counts
-          fetchConversations();
+        if (fullContent && conversationId) {
+          const assistantMessage: Message = {
+            id: `msg-${Date.now()}`,
+            role: 'assistant',
+            content: fullContent,
+            createdAt: new Date().toISOString(),
+          };
+          store.addMessage(assistantMessage);
+          store.addMessageToConversation(conversationId, assistantMessage);
         }
       } catch (err: unknown) {
         store.setIsSending(false);
@@ -215,16 +182,13 @@ export default function Home() {
         abortControllerRef.current = null;
 
         if (err instanceof Error && err.name === 'AbortError') {
-          // User cancelled - try to reload messages
-          if (conversationId) {
-            await fetchMessages(conversationId);
-          }
+          // User cancelled
         } else {
           toast.error(err instanceof Error ? err.message : 'Something went wrong');
         }
       }
     },
-    [store, fetchMessages, fetchConversations]
+    [store]
   );
 
   // Handle stop generating
@@ -242,35 +206,17 @@ export default function Home() {
 
   // Handle delete conversation
   const handleDeleteConversation = useCallback(
-    async (id: string) => {
-      try {
-        const res = await fetch(`/api/conversations/${id}`, { method: 'DELETE' });
-        if (res.ok) {
-          if (store.activeConversationId === id) {
-            store.resetChat();
-          }
-          store.setConversations(store.conversations.filter((c) => c.id !== id));
-          toast.success('Conversation deleted');
-        }
-      } catch {
-        toast.error('Failed to delete conversation');
-      }
+    (id: string) => {
+      store.deleteConversation(id);
+      toast.success('Conversation deleted');
     },
     [store]
   );
 
   // Handle clear all conversations
-  const handleClearAll = useCallback(async () => {
-    try {
-      const res = await fetch('/api/conversations', { method: 'DELETE' });
-      if (res.ok) {
-        store.setConversations([]);
-        store.resetChat();
-        toast.success('All conversations cleared');
-      }
-    } catch {
-      toast.error('Failed to clear conversations');
-    }
+  const handleClearAll = useCallback(() => {
+    store.clearAllConversations();
+    toast.success('All conversations cleared');
   }, [store]);
 
   return (
