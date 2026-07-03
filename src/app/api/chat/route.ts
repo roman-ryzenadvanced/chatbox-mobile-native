@@ -69,7 +69,7 @@ export async function POST(req: NextRequest) {
           controller.enqueue('data: [DONE]\n\n');
           controller.close();
         } catch (streamError: any) {
-          console.error('Stream error, trying non-streaming fallback:', streamError?.message);
+          console.error('Stream error, trying non-streaming fallback:', streamError?.message, streamError?.stack);
 
           try {
             const fallbackResponse = await zai.chat.completions.create({
@@ -83,7 +83,7 @@ export async function POST(req: NextRequest) {
               controller.enqueue(`data: ${JSON.stringify({ content })}\n\n`);
             }
           } catch (fallbackError: any) {
-            console.error('Fallback failed:', fallbackError?.message);
+            console.error('Fallback failed:', fallbackError?.message, fallbackError?.stack);
             controller.enqueue(`data: ${JSON.stringify({ content: 'Sorry, I encountered an error. Please try again.' })}\n\n`);
           }
 
