@@ -1,8 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server';
 import ZAI from 'z-ai-web-dev-sdk';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+
+// Ensure SDK config is available at runtime (needed for Vercel serverless)
+function ensureZAIConfig() {
+  const configStr = process.env.Z_AI_CONFIG;
+  if (!configStr) return;
+
+  const configPath = path.join(os.tmpdir(), '.z-ai-config');
+  if (!fs.existsSync(configPath)) {
+    try {
+      fs.writeFileSync(configPath, configStr, 'utf-8');
+    } catch {}
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {
+    ensureZAIConfig();
+
     const body = await req.json();
     const { messages: chatMessages } = body;
 
@@ -25,7 +43,6 @@ export async function POST(req: NextRequest) {
             stream: true,
           });
 
-          // Handle different response types from the SDK
           if (response && typeof response === 'object' && Symbol.asyncIterator in Object(response)) {
             for await (const chunk of response as AsyncIterable<any>) {
               const content = chunk?.choices?.[0]?.delta?.content || chunk?.content || '';
@@ -50,7 +67,6 @@ export async function POST(req: NextRequest) {
         } catch (streamError: any) {
           console.error('Stream error, trying non-streaming fallback:', streamError?.message);
 
-          // Non-streaming fallback
           try {
             const fallbackResponse = await zai.chat.completions.create({
               messages: chatMessages,
