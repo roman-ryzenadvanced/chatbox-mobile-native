@@ -2,36 +2,24 @@ import { NextRequest, NextResponse } from 'next/server';
 import ZAI from 'z-ai-web-dev-sdk';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 
 // Ensure SDK config is available at runtime (needed for Vercel serverless)
 function ensureZAIConfig() {
   const configStr = process.env.Z_AI_CONFIG;
   if (!configStr) return;
 
-  // Write to current working directory (first place SDK looks)
-  const cwdPath = path.join(process.cwd(), '.z-ai-config');
-  try {
-    if (!fs.existsSync(cwdPath)) {
-      fs.writeFileSync(cwdPath, configStr, 'utf-8');
-    }
-  } catch {}
+  // On Vercel serverless, only /tmp is writable
+  // Temporarily override HOME to /tmp so SDK finds the config there
+  const tmpDir = '/tmp';
+  const configPath = path.join(tmpDir, '.z-ai-config');
 
-  // Also write to home dir as fallback
-  const homePath = path.join(os.homedir(), '.z-ai-config');
   try {
-    if (!fs.existsSync(homePath)) {
-      fs.writeFileSync(homePath, configStr, 'utf-8');
-    }
-  } catch {}
-
-  // Also write to /tmp as last resort
-  const tmpPath = path.join(os.tmpdir(), '.z-ai-config');
-  try {
-    if (!fs.existsSync(tmpPath)) {
-      fs.writeFileSync(tmpPath, configStr, 'utf-8');
-    }
-  } catch {}
+    fs.writeFileSync(configPath, configStr, 'utf-8');
+    // Override HOME env so os.homedir() returns /tmp
+    process.env.HOME = tmpDir;
+  } catch (e) {
+    console.error('Failed to write z-ai-config:', e);
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -48,7 +36,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Initialize ZAI SDK
     const zai = await ZAI.create();
     let fullContent = '';
 
