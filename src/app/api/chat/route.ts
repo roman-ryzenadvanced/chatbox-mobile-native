@@ -3,19 +3,15 @@ import ZAI from 'z-ai-web-dev-sdk';
 import fs from 'fs';
 import path from 'path';
 
-// Ensure SDK config is available at runtime (needed for Vercel serverless)
 function ensureZAIConfig() {
   const configStr = process.env.Z_AI_CONFIG;
   if (!configStr) return;
 
-  // On Vercel serverless, only /tmp is writable
-  // Temporarily override HOME to /tmp so SDK finds the config there
   const tmpDir = '/tmp';
   const configPath = path.join(tmpDir, '.z-ai-config');
 
   try {
     fs.writeFileSync(configPath, configStr, 'utf-8');
-    // Override HOME env so os.homedir() returns /tmp
     process.env.HOME = tmpDir;
   } catch (e) {
     console.error('Failed to write z-ai-config:', e);
@@ -69,7 +65,7 @@ export async function POST(req: NextRequest) {
           controller.enqueue('data: [DONE]\n\n');
           controller.close();
         } catch (streamError: any) {
-          console.error('Stream error, trying non-streaming fallback:', streamError?.message, streamError?.stack);
+          console.error('Stream error, trying non-streaming fallback:', streamError?.message);
 
           try {
             const fallbackResponse = await zai.chat.completions.create({
@@ -83,8 +79,8 @@ export async function POST(req: NextRequest) {
               controller.enqueue(`data: ${JSON.stringify({ content })}\n\n`);
             }
           } catch (fallbackError: any) {
-            console.error('Fallback failed:', fallbackError?.message, fallbackError?.stack);
-            controller.enqueue(`data: ${JSON.stringify({ content: 'Sorry, I encountered an error. Please try again.' })}\n\n`);
+            console.error('Fallback failed:', fallbackError?.message);
+            controller.enqueue(`data: ${JSON.stringify({ content: '⚠️ AI service is currently unavailable. The app works fully in the local development environment. For public deployment, connect an external AI provider (OpenAI, Claude, etc.) to the chat API route.' })}\n\n`);
           }
 
           controller.enqueue('data: [DONE]\n\n');
