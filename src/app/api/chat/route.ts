@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/lib/db';
+import { memoryStore, isServerless } from '@/lib/memory-store';
 import ZAI from 'z-ai-web-dev-sdk';
 
 export async function POST(req: NextRequest) {
@@ -14,130 +14,139 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Save user message to database
-    await db.message.create({
-      data: {
-        role: 'user',
-        content: message,
-        conversationId,
-      },
-    });
-
-    // Update conversation timestamp
-    await db.conversation.update({
-      where: { id: conversationId },
-      data: { updatedAt: new Date() },
-    });
-
-    // Fetch conversation for system prompt
-    const conversation = await db.conversation.findUnique({
-      where: { id: conversationId },
-    });
-
-    if (!conversation) {
-      return NextResponse.json(
-        { error: 'Conversation not found' },
-        { status: 404 }
-      );
+    // Save user message
+    if (isServerless) {
+      memoryStore.addMessage(conversationId, 'user', message);
+    } else {
+      const { db } = await import('@/lib/db');
+      await db.message.create({
+        data: { role: 'user', content: message, conversationId },
+      });
+      await db.conversation.update({
+        where: { id: conversationId },
+        data: { updatedAt: new Date() },
+      });
     }
 
-    // Fetch past messages for context
-    const pastMessages = await db.message.findMany({
-      where: { conversationId },
-      orderBy: { createdAt: 'asc' },
-      select: { role: true, content: true },
-    });
+    // Build message history
+    let chatMessages: Array<{ role: string; content: string }>;
 
-    // Build message history for the AI
-    const chatMessages = [
-      { role: 'system' as const, content: conversation.systemPrompt },
-      ...pastMessages.map((m) => ({
-        role: (m.role === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
-        content: m.content,
-      })),
-    ];
+    if (isServerless) {
+      const conv = memoryStore.getConversation(conversationId);
+      if (!conv) {
+        return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
+      }
+      chatMessages = [
+        { role: 'system', content: conv.systemPrompt },
+        ...memoryStore.getMessages(conversationId).map(m => ({
+          role: m.role === 'user' ? 'user' : 'assistant',
+          content: m.content,
+        })),
+      ];
+    } else {
+      const { db } = await import('@/lib/db');
+      const conversation = await db.conversation.findUnique({ where: { id: conversationId } });
+      if (!conversation) {
+        return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
+      }
+      const pastMessages = await db.message.findMany({
+        where: { conversationId },
+        orderBy: { createdAt: 'asc' },
+        select: { role: true, content: true },
+      });
+      chatMessages = [
+        { role: 'system', content: conversation.systemPrompt },
+        ...pastMessages.map(m => ({
+          role: m.role === 'user' ? 'user' : 'assistant',
+          content: m.content,
+        })),
+      ];
+    }
 
     // Initialize ZAI SDK
     const zai = await ZAI.create();
-
-    // Buffer to collect the full response for saving to DB
     let fullContent = '';
 
-    // Stream the response
     const stream = new ReadableStream({
       async start(controller) {
         try {
           const response = await zai.chat.completions.create({
-            messages: chatMessages,
+            messages: chatMessages as any,
             stream: true,
           });
 
-          // The SDK returns a stream - handle it based on the response type
+          // Handle different response types from the SDK
           if (response && typeof response === 'object' && Symbol.asyncIterator in Object(response)) {
-            // AsyncIterable stream
             for await (const chunk of response as AsyncIterable<any>) {
-              const content =
-                chunk?.choices?.[0]?.delta?.content ||
-                chunk?.content ||
-                '';
+              const content = chunk?.choices?.[0]?.delta?.content || chunk?.content || '';
               if (content) {
                 fullContent += content;
-                const data = JSON.stringify({ content });
-                controller.enqueue(`data: ${data}\n\n`);
+                controller.enqueue(`data: ${JSON.stringify({ content })}\n\n`);
               }
             }
           } else if (response && typeof response === 'string') {
-            // Plain string response
             fullContent = response;
-            const data = JSON.stringify({ content: response });
-            controller.enqueue(`data: ${data}\n\n`);
+            controller.enqueue(`data: ${JSON.stringify({ content: response })}\n\n`);
           } else if (response) {
-            // Try to extract content from the response object
-            const content =
-              response?.choices?.[0]?.message?.content ||
-              response?.content ||
-              '';
+            const content = response?.choices?.[0]?.message?.content || response?.content || '';
             if (content) {
               fullContent = content;
-              const data = JSON.stringify({ content });
-              controller.enqueue(`data: ${data}\n\n`);
+              controller.enqueue(`data: ${JSON.stringify({ content })}\n\n`);
             }
           }
 
-          // Send done signal
           controller.enqueue('data: [DONE]\n\n');
           controller.close();
 
-          // Save the assistant's full response to the database (fire and forget)
+          // Save assistant response
           if (fullContent) {
-            await db.message.create({
-              data: {
-                role: 'assistant',
-                content: fullContent,
-                conversationId,
-              },
-            }).catch((err) => {
-              console.error('Failed to save assistant message:', err);
-            });
+            if (isServerless) {
+              memoryStore.addMessage(conversationId, 'assistant', fullContent);
+            } else {
+              const { db } = await import('@/lib/db');
+              await db.message.create({
+                data: { role: 'assistant', content: fullContent, conversationId },
+              }).catch((err: any) => console.error('Failed to save assistant message:', err));
+            }
           }
-        } catch (streamError) {
-          console.error('Stream error:', streamError);
+        } catch (streamError: any) {
+          console.error('Stream error, trying fallback:', streamError?.message);
 
-          // Save whatever content we have so far
-          if (fullContent) {
-            await db.message.create({
-              data: {
-                role: 'assistant',
-                content: fullContent,
-                conversationId,
-              },
-            }).catch((err) => {
-              console.error('Failed to save partial assistant message:', err);
+          // If streaming fails, try non-streaming fallback
+          try {
+            const fallbackResponse = await zai.chat.completions.create({
+              messages: chatMessages as any,
+              stream: false,
             });
+
+            const content = fallbackResponse?.choices?.[0]?.message?.content || fallbackResponse?.content || '';
+
+            if (content) {
+              fullContent = content;
+              controller.enqueue(`data: ${JSON.stringify({ content })}\n\n`);
+            }
+          } catch (fallbackError: any) {
+            console.error('Fallback also failed:', fallbackError?.message);
+            // Send error message to the client
+            controller.enqueue(`data: ${JSON.stringify({ content: 'Sorry, I encountered an error. Please try again.', isError: true })}\n\n`);
           }
 
           controller.enqueue('data: [DONE]\n\n');
           controller.close();
+
+          // Save whatever content we have
+          if (fullContent) {
+            if (isServerless) {
+              memoryStore.addMessage(conversationId, 'assistant', fullContent);
+            } else {
+              try {
+                const { db } = await import('@/lib/db');
+                await db.message.create({
+                  data: { role: 'assistant', content: fullContent, conversationId },
+                });
+              } catch {}
+            }
+          }
         }
       },
     });
@@ -149,10 +158,10 @@ export async function POST(req: NextRequest) {
         Connection: 'keep-alive',
       },
     });
-  } catch (error) {
+  } catch (error: any) {
     console.error('Chat API error:', error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
+      { error: error?.message || 'Internal server error' },
       { status: 500 }
     );
   }

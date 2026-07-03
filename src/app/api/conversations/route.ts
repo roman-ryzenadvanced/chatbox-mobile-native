@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/lib/db';
+import { memoryStore, isServerless } from '@/lib/memory-store';
 
 // GET /api/conversations - List all conversations
 export async function GET() {
   try {
-    const conversations = await db.conversation.findMany({
+    if (isServerless) {
+      return NextResponse.json(memoryStore.listConversations());
+    }
+
+    const { db } = await import('@/lib/db');
+    const result = await db.conversation.findMany({
       select: {
         id: true,
         title: true,
@@ -12,19 +17,15 @@ export async function GET() {
         model: true,
         createdAt: true,
         updatedAt: true,
-        _count: {
-          select: { messages: true },
-        },
+        _count: { select: { messages: true } },
       },
       orderBy: { updatedAt: 'desc' },
     });
 
-    const result = conversations.map((c) => ({
+    return NextResponse.json(result.map((c) => ({
       ...c,
       messageCount: c._count.messages,
-    }));
-
-    return NextResponse.json(result);
+    })));
   } catch (error) {
     console.error('Failed to fetch conversations:', error);
     return NextResponse.json(
@@ -40,6 +41,12 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     const { title, systemPrompt } = body;
 
+    if (isServerless) {
+      const conv = memoryStore.createConversation({ title, systemPrompt });
+      return NextResponse.json(conv, { status: 201 });
+    }
+
+    const { db } = await import('@/lib/db');
     const conversation = await db.conversation.create({
       data: {
         title: title || 'New Chat',
@@ -61,6 +68,12 @@ export async function POST(req: NextRequest) {
 // DELETE /api/conversations - Delete all conversations
 export async function DELETE() {
   try {
+    if (isServerless) {
+      memoryStore.clearAll();
+      return NextResponse.json({ success: true });
+    }
+
+    const { db } = await import('@/lib/db');
     await db.message.deleteMany({});
     await db.conversation.deleteMany({});
     return NextResponse.json({ success: true });
